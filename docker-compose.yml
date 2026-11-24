@@ -7,6 +7,8 @@ services:
     environment:
       # 每读一个块的模拟延迟（秒），0 表示最快
       READ_DELAY: "0.05"
+      # 整理时每写一个差异块的模拟延迟（秒）
+      CONSOLIDATE_DELAY: "0.05"
       TAPE_ROOT: /data/tapes
       OUTPUT_ROOT: /data/output
     volumes:

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>磁带灾备恢复演练</title>
   <style>
-    :root { --ok:#1a7f37; --bad:#b42318; --warn:#b54708; --line:#d0d7de; }
+    :root { --ok:#1a7f37; --bad:#b42318; --warn:#b54708; --line:#d0d7de; --info:#0969da; }
     * { box-sizing: border-box; }
     body { font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
            margin: 0; background:#f6f8fa; color:#1f2328; }
@@ -34,11 +34,13 @@
     .pill.bad { background:#ffebe9; color:var(--bad); }
     .pill.run { background:#fff8c5; color:var(--warn); }
     .pill.none { background:#eaeef2; color:#57606a; }
+    .pill.info { background:#ddf4ff; color:var(--info); }
     .metrics { display:flex; gap:12px; flex-wrap:wrap; margin:10px 0; }
     .metric { background:#f6f8fa; border:1px solid var(--line); border-radius:8px;
               padding:10px 14px; min-width:120px; }
     .metric b { display:block; font-size:20px; }
     .metric span { font-size:12px; color:#57606a; }
+    .metric.highlight { background:#dafbe1; border-color:#aceebb; }
     pre { background:#0d1117; color:#c9d1d9; padding:12px; border-radius:8px;
           font-size:12px; max-height:260px; overflow:auto; white-space:pre-wrap; }
     a.dl { font-size:12px; color:#0969da; text-decoration:none; }
@@ -46,18 +48,20 @@
     .full { grid-column: 1 / -1; }
     .err { background:#ffebe9; border:1px solid #ffabaf; color:var(--bad);
            padding:10px 12px; border-radius:8px; font-size:13px; margin:8px 0; }
+    .storeline { font-size:12px; color:#57606a; margin-top:10px; padding-top:10px;
+                 border-top:1px dashed var(--line); }
   </style>
 </head>
 <body>
 <header>
   <h1>磁带灾备恢复演练（单机两带 · 4 KiB 镜像块）</h1>
-  <p>换带/回卷后从头顺读，跳过的块也算读量；镜像只按块号追加，每块写出前核对 SHA-256；坏块或额度不足即失败并保留上次成品。</p>
+  <p>换带/回卷后从头顺读，跳过的块也算读量；镜像只按块号追加，每块写出前核对 SHA-256；坏块或额度不足即失败并保留上次成品。成品盘紧张时可对两份等长成品做块级整理：同号同内容块只留一份。</p>
 </header>
 <main>
   <section class="card">
     <h2>1. 选择本地带卷</h2>
     <table>
-      <thead><tr><th>带卷</th><th>磁带数</th><th>镜像块</th><th>预估读带/暂存</th><th>上次成品</th><th></th></tr></thead>
+      <thead><tr><th>带卷</th><th>磁带数</th><th>镜像块</th><th>预估读带/暂存</th><th>成品</th><th></th></tr></thead>
       <tbody>
       {% for s in sets %}
         <tr>
@@ -66,14 +70,18 @@
           <td>{{ s.block_count }}</td>
           <td>{{ s.estimate.blocks_read }} / {{ s.estimate.staging_peak }} 块</td>
           <td>
-            {% if s.has_artifact %}
-              <span class="pill ok">{{ s.artifact_size }} B</span>
+            {% if s.product %}
+              {% if s.product.state == "consolidated" %}
+                <span class="pill info">已整理 {{ s.product.size }} B</span>
+              {% else %}
+                <span class="pill ok">未整理 {{ s.product.size }} B</span>
+              {% endif %}
             {% else %}
               <span class="pill none">无</span>
             {% endif %}
           </td>
           <td>
-            {% if s.has_artifact %}
+            {% if s.product %}
               <a class="dl" href="{{ url_for('download', set_name=s.name) }}">下载成品</a>
             {% endif %}
           </td>
@@ -109,14 +117,66 @@
   </section>
 
   <section class="card full">
-    <h2>3. 任务状态与实际用量
+    <h2>3. 成品整理（块级去重）</h2>
+    <form method="post" action="{{ url_for('consolidate_view') }}">
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;">
+        <div>
+          <label for="set_a">成品 A（尚未整理）</label>
+          <select id="set_a" name="set_a" required {% if job.running %}disabled{% endif %}>
+            {% for p in plain_products %}
+              <option value="{{ p.name }}">{{ p.name }}（{{ p.size }} B / {{ (p.size / 4096)|int }} 块）</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label for="set_b">成品 B（与 A 等长）</label>
+          <select id="set_b" name="set_b" required {% if job.running %}disabled{% endif %}>
+            {% for p in plain_products %}
+              <option value="{{ p.name }}" {% if loop.index == 2 %}selected{% endif %}>{{ p.name }}（{{ p.size }} B / {{ (p.size / 4096)|int }} 块）</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label for="extra_quota">整理期间额外占用上限（4 KiB 块）</label>
+          <input id="extra_quota" name="extra_quota" type="number" min="0" max="100000"
+                 value="{{ job.extra_quota or 12 }}" required {% if job.running %}disabled{% endif %}>
+        </div>
+      </div>
+      <button type="submit" {% if job.running or plain_products|length < 2 %}disabled{% endif %}>开始整理</button>
+      <p class="hint">
+        整理只读成品，不碰带卷：逐块比对两份等长成品，同一块号上内容相同的块只保留一份。
+        期间唯一多占的镜像数据是 B 的差异块（临时段文件同样计入上限），额度等于差异块数时即可完成；
+        整理期间与失败后两份成品均可从原链接完整下载，成功后原链接仍返回相同字节（重启后不变）。
+      </p>
+    </form>
+    <div class="storeline">
+      块仓库现状：段文件 {{ store_stats.segments }} 个 · 段内数据块 {{ store_stats.segment_blocks }} 个 ·
+      清单引用 {{ store_stats.refs }} 条 · 已整理成品 {{ store_stats.consolidated_sets }} 套
+      {% if not plain_products %}（暂无可整理的未整理成品，先恢复带卷）{% endif %}
+    </div>
+  </section>
+
+  <section class="card full">
+    <h2>4. 任务状态与实际用量
       {% if job.running %}
-        <span class="pill run">运行中 · {{ job.set_name }}</span>
+        {% if job.kind == "consolidate" %}
+          <span class="pill run">整理中 · {{ job.pair[0] }} + {{ job.pair[1] }}</span>
+        {% else %}
+          <span class="pill run">恢复中 · {{ job.set_name }}</span>
+        {% endif %}
       {% elif job.result %}
         {% if job.result.success %}
-          <span class="pill ok">成功 · {{ job.set_name }}</span>
+          {% if job.result.kind == "consolidate" %}
+            <span class="pill ok">整理成功 · {{ job.result.set_a }} + {{ job.result.set_b }}</span>
+          {% else %}
+            <span class="pill ok">恢复成功 · {{ job.set_name }}</span>
+          {% endif %}
         {% else %}
-          <span class="pill bad">失败 · {{ job.set_name }}</span>
+          {% if job.result.kind == "consolidate" %}
+            <span class="pill bad">整理失败 · {{ job.result.set_a }} + {{ job.result.set_b }}</span>
+          {% else %}
+            <span class="pill bad">恢复失败 · {{ job.set_name }}</span>
+          {% endif %}
         {% endif %}
       {% else %}
         <span class="pill none">暂无任务</span>
@@ -124,10 +184,23 @@
     </h2>
 
     {% if job.error %}
-      <div class="err">错误：{{ job.error }}（上次成品已保留，未被覆盖）</div>
+      <div class="err">错误：{{ job.error }}（两份成品原样保留，原链接可继续下载）</div>
     {% endif %}
 
-    {% if job.result %}
+    {% if job.result and job.result.kind == "consolidate" and job.result.success %}
+    <div class="metrics">
+      <div class="metric highlight"><b>{{ job.result.saved_blocks }}</b><span>实际省下的镜像数据块</span></div>
+      <div class="metric"><b>{{ job.result.blocks }}</b><span>每份成品块数</span></div>
+      <div class="metric"><b>{{ job.result.shared_blocks }}</b><span>同号同内容块（只留一份）</span></div>
+      <div class="metric"><b>{{ job.result.diff_blocks }}</b><span>差异块</span></div>
+      <div class="metric"><b>{{ job.result.extra_peak_blocks }}</b><span>期间额外占用峰值（块）</span></div>
+    </div>
+    <p>
+      <a class="dl" href="{{ url_for('download', set_name=job.result.set_a) }}">下载 {{ job.result.set_a }} 成品 →</a>
+      &nbsp;&nbsp;
+      <a class="dl" href="{{ url_for('download', set_name=job.result.set_b) }}">下载 {{ job.result.set_b }} 成品 →</a>
+    </p>
+    {% elif job.result and job.result.kind == "recover" %}
     <div class="metrics">
       <div class="metric"><b>{{ job.result.metrics.blocks_read }}</b><span>实际读带块数</span></div>
       <div class="metric"><b>{{ job.result.metrics.staging_peak }}</b><span>暂存峰值（块）</span></div>

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""生成三套样例带卷（每套 12 个 4 KiB 镜像块、最多两盘磁带）。
+"""生成样例带卷（每套 12 个 4 KiB 镜像块、最多两盘磁带）。
 
 用法::
 
@@ -10,6 +10,8 @@
 * sample-ordered   ：块号与带上位置一致，顺序读完即可，无需暂存
 * sample-scrambled ：块在两盘带上交错排布，恢复需要多次换带并使用暂存
 * sample-bad       ：布局同乱序样例，但块 11 的内容被故意损坏（摘要不符）
+* sample-pair-a / sample-pair-b ：整理（去重）演练专用的一对等长带卷，
+  恢复后的两份镜像前 8 个同号块内容完全相同、后 4 个块各自不同
 
 注意：坏块样例的清单仍记录正确摘要，损坏发生在带卷数据上，
 用于验证“写入前核对 SHA-256、遇坏块报错且保留上次成品”。
@@ -22,10 +24,14 @@ import hashlib
 import json
 import os
 import sys
+from typing import Callable
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.storage import BLOCK_SIZE, MAX_BLOCKS_PER_SET  # noqa: E402
+
+# 成对样例中两份镜像共享的同号块数（前 8 块一致，后 4 块有差异）。
+PAIR_SHARED_BLOCKS = 8
 
 
 def block_content(set_name: str, index: int) -> bytes:
@@ -36,15 +42,40 @@ def block_content(set_name: str, index: int) -> bytes:
     return header + fill
 
 
-def write_set(root: str, name: str, layout: list[tuple[int, int, int]]) -> None:
+def pair_block_content(payload: str, index: int) -> bytes:
+    """成对样例的块内容：payload 相同的同号块内容一致。"""
+
+    header = f"DRILL-BLOCK pair={payload} index={index}\n".encode("utf-8")
+    fill = bytes(((b + index * 7) & 0xFF) for b in range(BLOCK_SIZE - len(header)))
+    return header + fill
+
+
+def pair_content_fn(payload: str) -> Callable[[int], bytes]:
+    """成对样例的内容函数：前 PAIR_SHARED_BLOCKS 块两份一致，其余各自不同。"""
+
+    def fn(index: int) -> bytes:
+        tag = "shared" if index < PAIR_SHARED_BLOCKS else payload
+        return pair_block_content(tag, index)
+
+    return fn
+
+
+def write_set(
+    root: str,
+    name: str,
+    layout: list[tuple[int, int, int]],
+    content_fn: Callable[[int], bytes] | None = None,
+) -> None:
     """layout: [(block_index, tape_no, tape_position), ...]"""
 
+    if content_fn is None:
+        content_fn = lambda index: block_content(name, index)  # noqa: E731
     set_dir = os.path.join(root, name)
     os.makedirs(set_dir, exist_ok=True)
     frames: dict[int, list[tuple[int, int, bytes]]] = {}
     manifest_blocks = []
     for index, tape, position in layout:
-        data = block_content(name, index)
+        data = content_fn(index)
         assert len(data) == BLOCK_SIZE
         frames.setdefault(tape, []).append((position, index, data))
         manifest_blocks.append(
@@ -106,6 +137,12 @@ def main() -> int:
     # 3) 坏块样例：同样布局，块 11（tape1 位置 0）内容损坏
     write_set(args.root, "sample-bad", scrambled)
     corrupt_frame(args.root, "sample-bad", tape=1, position=0)
+
+    # 4) 整理演练对：两份等长（12 块）带卷，均为顺序布局；
+    #    恢复后的成品前 8 个同号块内容完全相同、后 4 个块各自不同。
+    pair_layout = [(i, 0, i) for i in range(6)] + [(6 + i, 1, i) for i in range(6)]
+    write_set(args.root, "sample-pair-a", pair_layout, pair_content_fn("a"))
+    write_set(args.root, "sample-pair-b", pair_layout, pair_content_fn("b"))
 
     print("完成。")
     return 0
